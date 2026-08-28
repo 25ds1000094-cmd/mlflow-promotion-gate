@@ -17,7 +17,8 @@ def valid_version?(value)
   return false unless value.is_a?(String)
   return false unless value.match?(/\A[1-9][0-9]*\z/)
 
-  value.to_i <= MAX_SAFE_INTEGER
+  n = value.to_i
+  n >= 1 && n <= MAX_SAFE_INTEGER
 end
 
 def parse_timestamp(value)
@@ -73,19 +74,18 @@ end
 def check_version(version, policy, as_of, policy_is_valid)
   failures = []
 
-  unless policy_is_valid
-    failures << "INVALID_POLICY"
-  end
-
   unless version.is_a?(Hash)
-    failures << "INVALID_VERSION"
-    return failures.uniq.sort
+    return ["INVALID_VERSION"]
   end
 
   version_id = version["version"]
 
   unless valid_version?(version_id)
     failures << "INVALID_VERSION"
+  end
+
+  unless policy_is_valid
+    failures << "INVALID_POLICY"
   end
 
   evaluation = version["evaluation"]
@@ -129,15 +129,9 @@ def check_version(version, policy, as_of, policy_is_valid)
          finite_number?(size)
     failures << "NON_FINITE"
   else
-    unless accuracy.between?(0.0, 1.0)
-      failures << "METRIC_RANGE"
-    end
-
-    unless latency >= 0
-      failures << "METRIC_RANGE"
-    end
-
-    unless safe_non_negative_integer?(size)
+    if !accuracy.between?(0.0, 1.0) ||
+       latency < 0 ||
+       !safe_non_negative_integer?(size)
       failures << "METRIC_RANGE"
     end
   end
@@ -200,13 +194,9 @@ def ranking_key(version_id, version)
 end
 
 def public_failed_gates(failures_by_version)
-  result = {}
-
-  failures_by_version.keys.sort.each do |version_id|
-    result[version_id] = failures_by_version[version_id].uniq.sort
+  failures_by_version.each_with_object({}) do |(id, codes), result|
+    result[id] = codes.uniq.sort
   end
-
-  result
 end
 
 post "/promote" do
@@ -238,18 +228,13 @@ post "/promote" do
 
   versions = body["versions"]
 
-  # ------------------------------------------------------------
-  # Validate every occurrence before creating the lookup map.
-  # ------------------------------------------------------------
-
   occurrences = Hash.new(0)
   versions_by_id = {}
   failures_by_version = {}
 
-  versions.each do |version|
+  versions.each_with_index do |version, index|
     unless version.is_a?(Hash)
-      key = "__invalid_#{failures_by_version.length + 1}__"
-
+      key = "__invalid_#{index}__"
       failures_by_version[key] = ["INVALID_VERSION"]
       next
     end
@@ -257,14 +242,7 @@ post "/promote" do
     id = version["version"]
 
     unless valid_version?(id)
-      # Keep invalid string IDs visible in failedGates.
-      # Non-string IDs receive a deterministic private key.
-      key =
-        if id.is_a?(String)
-          id
-        else
-          "__invalid_#{failures_by_version.length + 1}__"
-        end
+      key = id.is_a?(String) ? id : "__invalid_#{index}__"
 
       failures_by_version[key] ||= []
       failures_by_version[key] << "INVALID_VERSION"
@@ -273,24 +251,15 @@ post "/promote" do
 
     occurrences[id] += 1
 
-    # Preserve the first occurrence for deterministic evaluation.
     versions_by_id[id] ||= version
   end
 
-  # ------------------------------------------------------------
-  # Duplicate IDs invalidate the version completely.
-  # ------------------------------------------------------------
-
   occurrences.each do |id, count|
-    next unless count > 1
-
-    failures_by_version[id] ||= []
-    failures_by_version[id] << "DUPLICATE_VERSION"
+    if count > 1
+      failures_by_version[id] ||= []
+      failures_by_version[id] << "DUPLICATE_VERSION"
+    end
   end
-
-  # ------------------------------------------------------------
-  # Evaluate every canonical version.
-  # ------------------------------------------------------------
 
   versions_by_id.each do |id, version|
     failures_by_version[id] ||= []
@@ -308,40 +277,16 @@ post "/promote" do
       failures_by_version[id].uniq.sort
   end
 
-  # Ensure every canonical version has an entry,
-  # including versions with no failures.
-  versions_by_id.each_key do |id|
-    failures_by_version[id] ||= []
-    failures_by_version[id] =
-      failures_by_version[id].uniq.sort
-  end
-
-  # ------------------------------------------------------------
-  # Eligible versions.
-  # ------------------------------------------------------------
-
   eligible_versions =
     versions_by_id.keys.select do |id|
       failures_by_version[id].empty?
     end
-
-  # ------------------------------------------------------------
-  # Deterministic ranking:
-  # accuracy DESC
-  # latency ASC
-  # size ASC
-  # numeric version ASC
-  # ------------------------------------------------------------
 
   eligible_versions.sort_by! do |id|
     ranking_key(id, versions_by_id[id])
   end
 
   champion_id = body["championVersion"]
-
-  # ------------------------------------------------------------
-  # Champion must exist and be canonical.
-  # ------------------------------------------------------------
 
   unless valid_version?(champion_id) &&
          versions_by_id.key?(champion_id)
@@ -359,12 +304,7 @@ post "/promote" do
     return json_response(result)
   end
 
-  # ------------------------------------------------------------
-  # Champion evidence must be valid.
-  # ------------------------------------------------------------
-
-  champion_failures =
-    failures_by_version[champion_id]
+  champion_failures = failures_by_version[champion_id]
 
   unless champion_failures.empty?
     result = {
@@ -382,10 +322,6 @@ post "/promote" do
 
   champion_evaluation =
     versions_by_id[champion_id]["evaluation"]
-
-  # ------------------------------------------------------------
-  # Select the best eligible version.
-  # ------------------------------------------------------------
 
   winner_id = eligible_versions.first
 
@@ -406,18 +342,11 @@ post "/promote" do
   winner_evaluation =
     versions_by_id[winner_id]["evaluation"]
 
-  champion_accuracy =
-    champion_evaluation["accuracy"]
-
-  winner_accuracy =
-    winner_evaluation["accuracy"]
-
   improvement =
-    (winner_accuracy - champion_accuracy).round(12)
-
-  # ------------------------------------------------------------
-  # Promotion gate.
-  # ------------------------------------------------------------
+    (
+      winner_evaluation["accuracy"] -
+      champion_evaluation["accuracy"]
+    ).round(12)
 
   if winner_id != champion_id &&
      improvement >= policy["minImprovement"]
@@ -438,10 +367,6 @@ post "/promote" do
     return json_response(result)
   end
 
-  # ------------------------------------------------------------
-  # Retain champion.
-  # ------------------------------------------------------------
-
   result = {
     "action" => "retain",
     "championVersion" => champion_id,
@@ -453,6 +378,10 @@ post "/promote" do
   }
 
   json_response(result)
+end
+
+def json_response(result)
+  JSON.generate(result)
 end
 
 get "/" do
