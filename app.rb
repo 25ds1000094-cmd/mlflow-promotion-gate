@@ -71,11 +71,16 @@ def policy_valid?(policy)
   end
 end
 
-def check_version(version, policy, as_of)
+def check_version(version, policy, as_of, policy_is_valid)
   failures = []
 
+  unless policy_is_valid
+    failures << "INVALID_POLICY"
+  end
+
   unless version.is_a?(Hash)
-    return ["INVALID_VERSION"]
+    failures << "INVALID_VERSION"
+    return failures.uniq.sort
   end
 
   version_id = version["version"]
@@ -91,10 +96,6 @@ def check_version(version, policy, as_of)
     return failures.uniq.sort
   end
 
-  # ------------------------------------------------------------
-  # Timestamp / freshness
-  # ------------------------------------------------------------
-
   created_at = parse_timestamp(evaluation["createdAt"])
 
   if created_at.nil?
@@ -102,100 +103,88 @@ def check_version(version, policy, as_of)
   else
     if created_at > as_of
       failures << "FUTURE_EVALUATION"
-    elsif created_at < as_of - policy["maxAgeSeconds"]
+    elsif policy_is_valid &&
+          created_at < as_of - policy["maxAgeSeconds"]
       failures << "STALE_EVALUATION"
     end
   end
-
-  # ------------------------------------------------------------
-  # Immutable lineage / evidence binding
-  # ------------------------------------------------------------
 
   if evaluation["artifactDigest"] != version["artifactDigest"]
     failures << "ARTIFACT_MISMATCH"
   end
 
-  if evaluation["datasetDigest"] != policy["datasetDigest"]
+  if policy_is_valid &&
+     evaluation["datasetDigest"] != policy["datasetDigest"]
     failures << "DATASET_MISMATCH"
   end
 
-  if evaluation["schemaDigest"] != policy["schemaDigest"]
+  if policy_is_valid &&
+     evaluation["schemaDigest"] != policy["schemaDigest"]
     failures << "SCHEMA_MISMATCH"
   end
-
-  # ------------------------------------------------------------
-  # Aggregate metrics
-  # ------------------------------------------------------------
 
   accuracy = evaluation["accuracy"]
   latency = evaluation["latencyMs"]
   size = evaluation["sizeBytes"]
 
-  # Accuracy, latency and size must all be finite.
   unless finite_number?(accuracy) &&
          finite_number?(latency) &&
          finite_number?(size)
     failures << "NON_FINITE"
   else
-    # Accuracy is [0,1].
     unless accuracy.between?(0.0, 1.0)
       failures << "METRIC_RANGE"
     end
 
-    # Latency is finite and non-negative.
     unless latency >= 0
       failures << "METRIC_RANGE"
     end
 
-    # Size is finite, non-negative and a safe integer.
     unless safe_non_negative_integer?(size)
       failures << "METRIC_RANGE"
     end
   end
 
-  # Accuracy floor only applies when accuracy itself is valid.
-  if finite_number?(accuracy) &&
+  if policy_is_valid &&
+     finite_number?(accuracy) &&
      accuracy.between?(0.0, 1.0) &&
      accuracy < policy["accuracyFloor"]
     failures << "ACCURACY_FLOOR"
   end
 
-  # Latency limit only applies when latency is valid.
-  if finite_number?(latency) &&
+  if policy_is_valid &&
+     finite_number?(latency) &&
      latency >= 0 &&
-     latency <= Float::INFINITY &&
      latency > policy["maxLatencyMs"]
     failures << "LATENCY_LIMIT"
   end
 
-  # Size limit only applies when size is a valid non-negative safe integer.
-  if safe_non_negative_integer?(size) &&
+  if policy_is_valid &&
+     safe_non_negative_integer?(size) &&
      size > policy["maxSizeBytes"]
     failures << "SIZE_LIMIT"
   end
 
-  # ------------------------------------------------------------
-  # Required slices
-  # ------------------------------------------------------------
-
   slices = evaluation["slices"]
 
-  policy["requiredSlices"].each do |name, floor|
-    unless slices.is_a?(Hash) && slices.key?(name)
-      failures << "MISSING_SLICE:#{name}"
-      next
-    end
+  if policy_is_valid
+    policy["requiredSlices"].each do |name, floor|
+      unless slices.is_a?(Hash) && slices.key?(name)
+        failures << "MISSING_SLICE:#{name}"
+        next
+      end
 
-    value = slices[name]
+      value = slices[name]
 
-    unless finite_number?(value) &&
-           value.between?(0.0, 1.0)
-      failures << "SLICE_RANGE:#{name}"
-      next
-    end
+      unless finite_number?(value) &&
+             value.between?(0.0, 1.0)
+        failures << "SLICE_RANGE:#{name}"
+        next
+      end
 
-    if value < floor
-      failures << "SLICE_FLOOR:#{name}"
+      if value < floor
+        failures << "SLICE_FLOOR:#{name}"
+      end
     end
   end
 
@@ -214,8 +203,9 @@ def ranking_key(version_id, version)
 end
 
 def public_failed_gates(failures_by_version)
-  failures_by_version
-    .transform_values { |codes| codes.uniq.sort }
+  failures_by_version.transform_values do |codes|
+    codes.uniq.sort
+  end
 end
 
 def json_response(result)
@@ -231,35 +221,21 @@ post "/promote" do
     invalid_input!
   end
 
-  # ------------------------------------------------------------
-  # Basic request validation
-  # ------------------------------------------------------------
-
   unless body.is_a?(Hash) &&
          body["asOf"].is_a?(String) &&
          body["championVersion"].is_a?(String) &&
-         body["policy"].is_a?(Hash) &&
+         body.key?("policy") &&
          body["versions"].is_a?(Array)
     invalid_input!
   end
 
   as_of = parse_timestamp(body["asOf"])
-
-  # Invalid asOf is invalid input rather than a model gate.
   invalid_input! if as_of.nil?
 
   policy = body["policy"]
-
-  # A missing/invalid policy is an input problem.
-  invalid_input! unless policy_valid?(policy)
+  policy_is_valid = policy_valid?(policy)
 
   versions = body["versions"]
-
-  # ------------------------------------------------------------
-  # FIRST PASS:
-  # Validate canonical IDs and detect duplicates BEFORE
-  # constructing the lookup map.
-  # ------------------------------------------------------------
 
   occurrences = Hash.new { |h, k| h[k] = 0 }
   versions_by_id = {}
@@ -269,8 +245,6 @@ post "/promote" do
     id = version.is_a?(Hash) ? version["version"] : nil
 
     unless valid_version?(id)
-      # String invalid IDs can still be reported by their value.
-      # For non-string IDs, use a deterministic placeholder.
       key = id.is_a?(String) ? id : "__invalid__"
 
       failures_by_version[key] ||= []
@@ -280,13 +254,8 @@ post "/promote" do
 
     occurrences[id] += 1
 
-    # Do NOT overwrite the first occurrence.
     versions_by_id[id] ||= version
   end
-
-  # ------------------------------------------------------------
-  # Mark duplicate canonical IDs.
-  # ------------------------------------------------------------
 
   occurrences.each do |id, count|
     next unless count > 1
@@ -295,15 +264,16 @@ post "/promote" do
     failures_by_version[id] << "DUPLICATE_VERSION"
   end
 
-  # ------------------------------------------------------------
-  # Check each unique canonical version.
-  # ------------------------------------------------------------
-
   versions_by_id.each do |id, version|
     failures_by_version[id] ||= []
 
     failures_by_version[id].concat(
-      check_version(version, policy, as_of)
+      check_version(
+        version,
+        policy,
+        as_of,
+        policy_is_valid
+      )
     )
 
     if occurrences[id] > 1
@@ -314,30 +284,16 @@ post "/promote" do
       failures_by_version[id].uniq.sort
   end
 
-  # Make sure every canonical version appears in failedGates,
-  # INCLUDING versions with zero failures.
   versions_by_id.each_key do |id|
     failures_by_version[id] ||= []
     failures_by_version[id] =
       failures_by_version[id].uniq.sort
   end
 
-  # ------------------------------------------------------------
-  # Determine eligible versions.
-  # ------------------------------------------------------------
-
   eligible_versions =
     versions_by_id.keys.select do |id|
       failures_by_version[id].empty?
     end
-
-  # ------------------------------------------------------------
-  # Deterministic ranking:
-  # accuracy DESC
-  # latency ASC
-  # size ASC
-  # numeric version ASC
-  # ------------------------------------------------------------
 
   eligible_versions.sort_by! do |id|
     ranking_key(id, versions_by_id[id])
@@ -345,16 +301,8 @@ post "/promote" do
 
   champion_id = body["championVersion"]
 
-  # ------------------------------------------------------------
-  # Champion must exist and be valid.
-  # ------------------------------------------------------------
-
   unless valid_version?(champion_id) &&
          versions_by_id.key?(champion_id)
-
-    champion_failures =
-      failures_by_version[champion_id] ||
-      ["INVALID_VERSION"]
 
     result = {
       "action" => "block",
@@ -368,10 +316,6 @@ post "/promote" do
 
     return json_response(result)
   end
-
-  # ------------------------------------------------------------
-  # Champion evidence must itself be valid.
-  # ------------------------------------------------------------
 
   champion_failures = failures_by_version[champion_id]
 
@@ -392,14 +336,8 @@ post "/promote" do
   champion_evaluation =
     versions_by_id[champion_id]["evaluation"]
 
-  # ------------------------------------------------------------
-  # Best eligible version.
-  # ------------------------------------------------------------
-
   winner_id = eligible_versions.first
 
-  # This should normally not happen because the champion is valid,
-  # but retain safely if there is no eligible winner.
   if winner_id.nil?
     result = {
       "action" => "retain",
@@ -426,11 +364,6 @@ post "/promote" do
   improvement =
     (winner_accuracy - champion_accuracy).round(12)
 
-  # ------------------------------------------------------------
-  # Promote only if the winner is a different version and
-  # meets the minimum improvement.
-  # ------------------------------------------------------------
-
   if winner_id != champion_id &&
      improvement >= policy["minImprovement"]
 
@@ -449,10 +382,6 @@ post "/promote" do
 
     return json_response(result)
   end
-
-  # ------------------------------------------------------------
-  # Otherwise retain the champion.
-  # ------------------------------------------------------------
 
   result = {
     "action" => "retain",
